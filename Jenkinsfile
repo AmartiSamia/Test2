@@ -1,18 +1,16 @@
 /**
- * ScrumOps CI/CD Pipeline (AKS + ACR)
- * Purpose: build → containerize → push → deploy with Ingress.
- *
- * Stages: Validate → Checkout → Detect Type → Dockerfile → Build App
- *         → Build Image → Push to ACR → Deploy to AKS → Verify → Post.
- *
- * Params: GITHUB_URL, PROJECT_NAME, IMAGE_NAME (optional), BRANCH (default: main).
- * Env:    ACR_SERVER (registry), IMAGE_TAG = ${BUILD_NUMBER}.
- * Creds:  acr-credentials (ACR push), kubeconfig-dev (AKS kubeconfig).
- *
- * Agent needs Docker; Maven/Node if used by the project.
- * kubectl is auto-installed if missing.
+ * ScrumOps CI/CD Pipeline
+ * 
+ * Simplified Jenkins pipeline for automated application deployment to Azure Kubernetes Service.
+ * This pipeline handles source code checkout, containerization, and deployment with minimal overhead.
+ * 
+ * Key Features:
+ * - Automatic project type detection (Node.js, Maven, Python, Static)
+ * - Dynamic Dockerfile generation for containerization
+ * - Azure Container Registry integration for image storage
+ * - Azure Kubernetes Service deployment with ingress configuration
+ * - Simplified configuration with essential parameters only
  */
-
 pipeline {
   agent any
 
@@ -32,7 +30,7 @@ pipeline {
   environment {
     // Azure Container Registry configuration
     ACR_SERVER = 'devopsmonitoracrrt2y5a.azurecr.io'
-    
+
     // Dynamic environment variables set during pipeline execution
     PROJECT_NAME = "${params.PROJECT_NAME}"
     GITHUB_URL = "${params.GITHUB_URL}"
@@ -51,7 +49,7 @@ pipeline {
           if (!params.PROJECT_NAME?.trim()) {
             error('Project name is required for deployment')
           }
-          
+
           echo "Starting deployment for project: ${params.PROJECT_NAME}"
           echo "Source repository: ${params.GITHUB_URL}"
           echo "Target branch: ${params.BRANCH}"
@@ -63,7 +61,7 @@ pipeline {
       steps {
         echo "Checking out source code from: ${params.GITHUB_URL}"
         deleteDir() // Clean workspace before checkout
-        
+
         script {
           try {
             // Attempt to checkout specified branch
@@ -77,7 +75,7 @@ pipeline {
               git branch: 'master', url: params.GITHUB_URL
             }
           }
-          
+
           // Capture git metadata for deployment tracking
           env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
           echo "Checked out commit: ${env.GIT_COMMIT_HASH}"
@@ -89,7 +87,7 @@ pipeline {
       steps {
         script {
           echo "Analyzing project structure for deployment configuration"
-          
+
           // Detect project type based on configuration files
           if (fileExists('package.json')) {
             env.PROJECT_TYPE = 'nodejs'
@@ -121,22 +119,35 @@ pipeline {
         script {
           if (!fileExists('Dockerfile')) {
             echo "Generating optimized Dockerfile for ${env.PROJECT_TYPE} project"
-            
+
             def dockerfileContent = ''
-            
+
             switch(env.PROJECT_TYPE) {
               case 'nodejs':
+                // NOTE: Use npm ci if package-lock.json exists; otherwise fallback to npm install
                 dockerfileContent = '''
 FROM node:18-alpine
 WORKDIR /app
+
+# Copy package manifests first for better layer caching
 COPY package*.json ./
-RUN npm ci --only=production
+
+# If a lockfile exists, prefer a clean, reproducible install.
+# Otherwise, do a regular install (use --omit=dev to mirror previous --only=production).
+RUN if [ -f package-lock.json ]; then \
+      npm ci --omit=dev; \
+    else \
+      npm install --omit=dev; \
+    fi
+
+# Copy the rest of the source
 COPY . .
+
 EXPOSE 3000
 CMD ["npm", "start"]
 '''
                 break
-                
+
               case 'maven':
                 dockerfileContent = '''
 FROM openjdk:17-jdk-slim
@@ -146,7 +157,7 @@ EXPOSE 8080
 CMD ["java", "-jar", "app.jar"]
 '''
                 break
-                
+
               case 'python':
                 dockerfileContent = '''
 FROM python:3.11-slim
@@ -158,7 +169,7 @@ EXPOSE 8000
 CMD ["python", "app.py"]
 '''
                 break
-                
+
               default: // static
                 dockerfileContent = '''
 FROM nginx:alpine
@@ -167,7 +178,7 @@ EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]
 '''
             }
-            
+
             writeFile file: 'Dockerfile', text: dockerfileContent
             echo "Generated Dockerfile for containerization"
           } else {
@@ -186,15 +197,13 @@ CMD ["nginx", "-g", "daemon off;"]
               echo "Building Maven project"
               sh 'mvn clean package -DskipTests'
               break
-              
+
             case 'nodejs':
-              echo "Installing dependencies and building Node.js project"
-              sh '''
-                npm ci
-                npm run build || echo "No build script found, proceeding with source files"
-              '''
+              // No npm on agent; installs happen in Dockerfile
+
+              echo "Skipping Node.js prebuild; handled inside Docker image"
               break
-              
+
             default:
               echo "No build step required for ${env.PROJECT_TYPE} project"
           }
@@ -208,14 +217,14 @@ CMD ["nginx", "-g", "daemon off;"]
           // Use custom image name if provided, otherwise use project name
           def imageName = params.IMAGE_NAME?.trim() ? params.IMAGE_NAME : params.PROJECT_NAME
           def fullImageName = "${env.ACR_SERVER}/${imageName}:${env.IMAGE_TAG}"
-          
+
           echo "Building container image: ${fullImageName}"
-          
+
           sh """
             docker build -t ${fullImageName} .
             docker tag ${fullImageName} ${env.ACR_SERVER}/${imageName}:latest
           """
-          
+
           // Store image name for later stages
           env.FULL_IMAGE_NAME = fullImageName
           env.IMAGE_NAME_USED = imageName
@@ -230,7 +239,7 @@ CMD ["nginx", "-g", "daemon off;"]
                                           passwordVariable: 'ACR_PASSWORD')]) {
           script {
             echo "Pushing container image to Azure Container Registry"
-            
+
             sh """
               echo "${ACR_PASSWORD}" | docker login "${ACR_SERVER}" -u "${ACR_USERNAME}" --password-stdin
               docker push ${env.FULL_IMAGE_NAME}
@@ -249,7 +258,7 @@ CMD ["nginx", "-g", "daemon off;"]
         ]) {
           script {
             echo "Deploying application to Azure Kubernetes Service"
-            
+
             // Ensure kubectl is available
             sh '''
               # Install kubectl locally in workspace if not available globally
@@ -264,7 +273,7 @@ CMD ["nginx", "-g", "daemon off;"]
               # Verify kubectl installation
               kubectl version --client || ./kubectl version --client
             '''
-            
+
             // Generate Kubernetes deployment manifests
             def k8sManifests = """
 apiVersion: v1
@@ -353,7 +362,7 @@ spec:
             port:
               number: 80
 """
-            
+
             // Setup Kubernetes environment and deploy
             sh '''
               export KUBECONFIG="${KUBECONFIG_FILE}"
@@ -375,10 +384,10 @@ spec:
                 --docker-password="${ACR_PASSWORD}" \
                 --dry-run=client -o yaml | $KUBECTL_CMD apply -f -
             '''
-            
+
             // Write and apply manifests
             writeFile file: 'k8s-deployment.yaml', text: k8sManifests
-            
+
             timeout(time: 10, unit: 'MINUTES') {
               sh '''
                 export KUBECONFIG="${KUBECONFIG_FILE}"
@@ -404,7 +413,7 @@ spec:
         withCredentials([file(credentialsId: 'kubeconfig-dev', variable: 'KUBECONFIG_FILE')]) {
           script {
             echo "Verifying deployment and generating access URL"
-            
+
             sh '''
               export KUBECONFIG="${KUBECONFIG_FILE}"
               export PATH="$PWD:$PATH"
@@ -416,11 +425,16 @@ spec:
               fi
               
               # Wait for ingress to be ready and get URL
-                $KUBECTL_CMD wait --for=condition=available ingress/${PROJECT_NAME}-ingress -n ${NAMESPACE} --timeout=200s
-                INGRESS_HOST=$($KUBECTL_CMD get ingress ${PROJECT_NAME}-ingress -n ${NAMESPACE} -o jsonpath='{.spec.rules[0].host}')
-                LIVE_URL="http://$INGRESS_HOST"
-                echo "Application successfully deployed and accessible at: $LIVE_URL"
-
+              for i in {1..20}; do
+                INGRESS_HOST=$($KUBECTL_CMD get ingress ${PROJECT_NAME}-ingress -n ${NAMESPACE} -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo "")
+                if [ -n "$INGRESS_HOST" ] && [ "$INGRESS_HOST" != "null" ]; then
+                  LIVE_URL="http://$INGRESS_HOST"
+                  echo "✅ Application successfully deployed and accessible at: $LIVE_URL"
+                  break
+                fi
+                echo "Waiting for ingress configuration (${i}/20)..."
+                sleep 10
+              done
               
               # Display deployment status
               echo "=== Deployment Summary ==="
@@ -442,15 +456,44 @@ spec:
         }
       }
     }
-    
+
     success {
       echo " Deployment completed successfully!"
       echo "Your application is now running on Azure Kubernetes Service."
     }
-    
+
     failure {
       echo " Deployment failed. Check the logs above for details."
-       echo "Logs: ${env.BUILD_URL}console"
+      withCredentials([file(credentialsId: 'kubeconfig-dev', variable: 'KUBECONFIG_FILE')]) {
+        sh '''
+          # Ensure kubectl is available for troubleshooting
+          if ! command -v kubectl >/dev/null 2>&1 && [ ! -x "./kubectl" ]; then
+            echo "Installing kubectl for troubleshooting..."
+            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" || true
+            chmod +x kubectl || true
+          fi
+          
+          export KUBECONFIG="${KUBECONFIG_FILE}"
+          export PATH="$PWD:$PATH"
+          echo "=== Troubleshooting Information ==="
+          
+          # Use kubectl or local kubectl
+          KUBECTL_CMD="kubectl"
+          if ! command -v kubectl >/dev/null 2>&1 && [ -x "./kubectl" ]; then
+            KUBECTL_CMD="./kubectl"
+          fi
+          
+          # Only run kubectl commands if kubectl is available
+          if command -v $KUBECTL_CMD >/dev/null 2>&1 || [ -x "./$KUBECTL_CMD" ]; then
+            $KUBECTL_CMD -n "${NAMESPACE}" describe deployment "${PROJECT_NAME}" || true
+            $KUBECTL_CMD -n "${NAMESPACE}" get pods -o wide || true
+            $KUBECTL_CMD -n "${NAMESPACE}" get events --sort-by=.lastTimestamp | tail -20 || true
+          else
+            echo "kubectl not available for troubleshooting"
+            echo "Please check Jenkins server configuration and ensure kubectl is installed"
+          fi
+        '''
+      }
     }
   }
 }
